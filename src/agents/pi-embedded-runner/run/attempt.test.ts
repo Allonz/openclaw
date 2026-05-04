@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { streamSimple } from "@mariozechner/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../../config/config.js";
@@ -10,10 +11,12 @@ import {
   buildAfterTurnRuntimeContextFromUsage,
   composeSystemPromptWithHookContext,
   decodeHtmlEntitiesInObject,
+  ensureVisibleAssistantTextInSessionTranscript,
   applyEmbeddedAttemptToolsAllow,
   isPrimaryBootstrapRun,
   mergeOrphanedTrailingUserPrompt,
   normalizeMessagesForLlmBoundary,
+  removeSessionManagerLeafEntry,
   prependSystemPromptAddition,
   remapInjectedContextFilesToWorkspace,
   resetEmbeddedAgentBaseStreamFnCacheForTest,
@@ -467,6 +470,299 @@ describe("remapInjectedContextFilesToWorkspace", () => {
         content: "outside",
       },
     ]);
+  });
+});
+
+describe("removeSessionManagerLeafEntry", () => {
+  it("removes the persisted leaf entry before rebuilding context", () => {
+    const orphan = { type: "message", id: "orphan-user", parentId: "assistant-1" };
+    const fileEntries = [
+      { type: "session", id: "session-1" },
+      { type: "message", id: "user-1", parentId: null },
+      { type: "message", id: "assistant-1", parentId: "user-1" },
+      orphan,
+    ];
+    const manager = {
+      fileEntries,
+      byId: new Map(fileEntries.map((entry) => [entry.id, entry])),
+      leafId: "orphan-user" as string | null,
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      _rewriteFile: vi.fn(),
+    };
+
+    removeSessionManagerLeafEntry({ sessionManager: manager, leafEntry: orphan });
+
+    expect(manager.fileEntries.map((entry) => entry.id)).toEqual([
+      "session-1",
+      "user-1",
+      "assistant-1",
+    ]);
+    expect(manager.byId.has("orphan-user")).toBe(false);
+    expect(manager.leafId).toBe("assistant-1");
+    expect(manager._rewriteFile).toHaveBeenCalledTimes(1);
+    expect(manager.branch).not.toHaveBeenCalled();
+    expect(manager.resetLeaf).not.toHaveBeenCalled();
+  });
+
+  it("falls back to in-memory branching when the manager cannot rewrite", () => {
+    const manager = {
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+    };
+
+    removeSessionManagerLeafEntry({
+      sessionManager: manager,
+      leafEntry: { id: "orphan-user", parentId: "assistant-1" },
+    });
+
+    expect(manager.branch).toHaveBeenCalledWith("assistant-1");
+    expect(manager.resetLeaf).not.toHaveBeenCalled();
+  });
+
+  it("falls back to branch when the entry is no longer the current leaf", () => {
+    const orphan = { type: "message", id: "orphan-user", parentId: "assistant-1" };
+    const fileEntries = [
+      { type: "session", id: "session-1" },
+      { type: "message", id: "user-1", parentId: null },
+      { type: "message", id: "assistant-1", parentId: "user-1" },
+      orphan,
+    ];
+    const manager = {
+      fileEntries,
+      byId: new Map(fileEntries.map((entry) => [entry.id, entry])),
+      leafId: "other-leaf" as string | null,
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      _rewriteFile: vi.fn(),
+    };
+
+    removeSessionManagerLeafEntry({ sessionManager: manager, leafEntry: orphan });
+
+    expect(manager.fileEntries.map((entry) => entry.id)).toEqual([
+      "session-1",
+      "user-1",
+      "assistant-1",
+      "orphan-user",
+    ]);
+    expect(manager.byId.has("orphan-user")).toBe(true);
+    expect(manager._rewriteFile).not.toHaveBeenCalled();
+    expect(manager.branch).toHaveBeenCalledWith("assistant-1");
+  });
+
+  it("falls back to branch when the target leaf has children", () => {
+    const orphan = { type: "message", id: "orphan-user", parentId: "assistant-1" };
+    const child = { type: "message", id: "child-assistant", parentId: "orphan-user" };
+    const fileEntries = [
+      { type: "session", id: "session-1" },
+      { type: "message", id: "user-1", parentId: null },
+      { type: "message", id: "assistant-1", parentId: "user-1" },
+      orphan,
+      child,
+    ];
+    const manager = {
+      fileEntries,
+      byId: new Map(fileEntries.map((entry) => [entry.id, entry])),
+      leafId: "orphan-user" as string | null,
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      _rewriteFile: vi.fn(),
+    };
+
+    removeSessionManagerLeafEntry({ sessionManager: manager, leafEntry: orphan });
+
+    expect(manager.fileEntries.map((entry) => entry.id)).toEqual([
+      "session-1",
+      "user-1",
+      "assistant-1",
+      "orphan-user",
+      "child-assistant",
+    ]);
+    expect(manager.byId.has("orphan-user")).toBe(true);
+    expect(manager._rewriteFile).not.toHaveBeenCalled();
+    expect(manager.branch).toHaveBeenCalledWith("assistant-1");
+  });
+});
+
+describe("ensureVisibleAssistantTextInSessionTranscript", () => {
+  it("does not append when the visible assistant text is already on the active branch", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Already persisted" }],
+      },
+    ] as unknown as AgentMessage[];
+    const activeSession = { agent: { state: { messages } } };
+    const buildSessionContext = vi.fn(() => ({ messages }));
+    const appendMessage = vi.fn();
+    const sessionManager = {
+      buildSessionContext,
+      appendMessage,
+    } as unknown as Parameters<
+      typeof ensureVisibleAssistantTextInSessionTranscript
+    >[0]["sessionManager"];
+
+    const repaired = ensureVisibleAssistantTextInSessionTranscript({
+      activeSession,
+      sessionManager,
+      visibleText: "Already persisted",
+      assistantTexts: ["Already persisted"],
+      provider: "openai",
+      modelId: "gpt-5.5",
+      modelApi: "responses",
+      runId: "run-1",
+      now: 1,
+    });
+
+    expect(repaired).toBe(false);
+    expect(appendMessage).not.toHaveBeenCalled();
+  });
+
+  it("compares canonical assistant text instead of joined delivery chunks", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "abcdef" }],
+      },
+    ] as unknown as AgentMessage[];
+    const activeSession = { agent: { state: { messages } } };
+    const appendMessage = vi.fn();
+    const sessionManager = {
+      buildSessionContext: vi.fn(() => ({ messages })),
+      appendMessage,
+    } as unknown as Parameters<
+      typeof ensureVisibleAssistantTextInSessionTranscript
+    >[0]["sessionManager"];
+
+    const repaired = ensureVisibleAssistantTextInSessionTranscript({
+      activeSession,
+      sessionManager,
+      visibleText: "abcdef",
+      assistantTexts: ["abc", "def"],
+      provider: "openai",
+      modelId: "gpt-5.5",
+      modelApi: "responses",
+      runId: "run-chunked",
+      now: 1,
+    });
+
+    expect(repaired).toBe(false);
+    expect(appendMessage).not.toHaveBeenCalled();
+  });
+
+  it("appends missing visible assistant text and refreshes active messages", () => {
+    const before = [{ role: "user", content: "hello" }] as unknown as AgentMessage[];
+    const after = [
+      ...before,
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Recovered answer" }],
+      },
+    ] as unknown as AgentMessage[];
+    const activeSession = { agent: { state: { messages: before } } };
+    const buildSessionContext = vi
+      .fn()
+      .mockReturnValueOnce({ messages: before })
+      .mockReturnValueOnce({
+        messages: after,
+      });
+    const appendMessage = vi.fn();
+    const sessionManager = {
+      buildSessionContext,
+      appendMessage,
+    } as unknown as Parameters<
+      typeof ensureVisibleAssistantTextInSessionTranscript
+    >[0]["sessionManager"];
+
+    const repaired = ensureVisibleAssistantTextInSessionTranscript({
+      activeSession,
+      sessionManager,
+      visibleText: "Recovered answer",
+      assistantTexts: ["Recovered answer"],
+      provider: "openai",
+      modelId: "gpt-5.5",
+      modelApi: "responses",
+      runId: "run-2",
+      now: 2,
+    });
+
+    expect(repaired).toBe(true);
+    expect(appendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        role: "assistant",
+        content: [{ type: "text", text: "Recovered answer" }],
+        timestamp: 2,
+        provider: "openai",
+        model: "gpt-5.5",
+      }),
+    );
+    expect(activeSession.agent.state.messages).toBe(after);
+  });
+
+  it("concatenates delivered chunks only when no canonical assistant text exists", () => {
+    const before = [{ role: "user", content: "hello" }] as unknown as AgentMessage[];
+    const after = [
+      ...before,
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "abcdef" }],
+      },
+    ] as unknown as AgentMessage[];
+    const activeSession = { agent: { state: { messages: before } } };
+    const appendMessage = vi.fn();
+    const sessionManager = {
+      buildSessionContext: vi.fn().mockReturnValueOnce({ messages: before }).mockReturnValueOnce({
+        messages: after,
+      }),
+      appendMessage,
+    } as unknown as Parameters<
+      typeof ensureVisibleAssistantTextInSessionTranscript
+    >[0]["sessionManager"];
+
+    const repaired = ensureVisibleAssistantTextInSessionTranscript({
+      activeSession,
+      sessionManager,
+      assistantTexts: ["abc", "def"],
+      provider: "openai",
+      modelId: "gpt-5.5",
+      modelApi: "responses",
+      runId: "run-no-canonical",
+      now: 3,
+    });
+
+    expect(repaired).toBe(true);
+    expect(appendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: [{ type: "text", text: "abcdef" }],
+      }),
+    );
+  });
+
+  it("does not fall back to delivered chunks when canonical assistant text is empty", () => {
+    const messages = [{ role: "user", content: "hello" }] as unknown as AgentMessage[];
+    const activeSession = { agent: { state: { messages } } };
+    const appendMessage = vi.fn();
+    const sessionManager = {
+      buildSessionContext: vi.fn(() => ({ messages })),
+      appendMessage,
+    } as unknown as Parameters<
+      typeof ensureVisibleAssistantTextInSessionTranscript
+    >[0]["sessionManager"];
+
+    const repaired = ensureVisibleAssistantTextInSessionTranscript({
+      activeSession,
+      sessionManager,
+      visibleText: "",
+      assistantTexts: ["delivery-only text"],
+      provider: "openai",
+      modelId: "gpt-5.5",
+      modelApi: "responses",
+      runId: "run-empty-canonical",
+      now: 4,
+    });
+
+    expect(repaired).toBe(false);
+    expect(appendMessage).not.toHaveBeenCalled();
   });
 });
 

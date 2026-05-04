@@ -102,6 +102,7 @@ import {
 } from "../../pi-embedded-helpers.js";
 import { countActiveToolExecutions } from "../../pi-embedded-subscribe.handlers.tools.js";
 import { subscribeEmbeddedPiSession } from "../../pi-embedded-subscribe.js";
+import { extractAssistantVisibleText } from "../../pi-embedded-utils.js";
 import { createPreparedEmbeddedPiSettingsManager } from "../../pi-project-settings.js";
 import {
   applyPiAutoCompactionGuard,
@@ -552,6 +553,112 @@ function isMidTurnPrecheckAssistantError(message: AgentMessage | undefined): boo
   }
   const record = message as unknown as { stopReason?: unknown; errorMessage?: unknown };
   return record.stopReason === "error" && record.errorMessage === MID_TURN_PRECHECK_ERROR_MESSAGE;
+}
+
+export function removeSessionManagerLeafEntry(params: {
+  sessionManager: {
+    branch: (branchFromId: string) => void;
+    resetLeaf: () => void;
+  };
+  leafEntry: { id?: string; parentId?: string | null };
+}): void {
+  const mutableSessionManager = params.sessionManager as unknown as {
+    fileEntries?: Array<{ id?: string; parentId?: string | null; type?: string }>;
+    byId?: Map<string, unknown>;
+    leafId?: string | null;
+    _rewriteFile?: () => void;
+  };
+  const leafId = params.leafEntry.id;
+  const fileEntries = mutableSessionManager.fileEntries;
+  const leafIndex = leafId ? fileEntries?.findIndex((entry) => entry.id === leafId) : -1;
+  const isCurrentLeaf = leafId && mutableSessionManager.leafId === leafId;
+  const hasChildren = leafId
+    ? (fileEntries?.some((entry) => entry.parentId === leafId) ?? true)
+    : true;
+
+  if (
+    leafId &&
+    fileEntries &&
+    leafIndex !== undefined &&
+    leafIndex >= 0 &&
+    isCurrentLeaf &&
+    !hasChildren &&
+    typeof mutableSessionManager._rewriteFile === "function"
+  ) {
+    fileEntries.splice(leafIndex, 1);
+    mutableSessionManager.byId?.delete(leafId);
+    mutableSessionManager.leafId = params.leafEntry.parentId ?? null;
+    mutableSessionManager._rewriteFile();
+    return;
+  }
+
+  if (params.leafEntry.parentId) {
+    params.sessionManager.branch(params.leafEntry.parentId);
+  } else {
+    params.sessionManager.resetLeaf();
+  }
+}
+
+function normalizeAssistantTranscriptCompareText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+export function ensureVisibleAssistantTextInSessionTranscript(params: {
+  activeSession: { agent: { state: { messages: AgentMessage[] } } };
+  sessionManager: Pick<
+    ReturnType<typeof guardSessionManager>,
+    "appendMessage" | "buildSessionContext"
+  >;
+  visibleText?: string;
+  assistantTexts: readonly string[];
+  provider: string;
+  modelId: string;
+  modelApi?: string;
+  usage?: unknown;
+  runId: string;
+  now?: number;
+}): boolean {
+  const visibleText =
+    params.visibleText?.trim() ??
+    params.assistantTexts
+      .map((text) => text.trim())
+      .filter(Boolean)
+      .join("")
+      .trim();
+  const normalizedVisibleText = normalizeAssistantTranscriptCompareText(visibleText);
+  if (!normalizedVisibleText) {
+    return false;
+  }
+
+  const context = params.sessionManager.buildSessionContext();
+  const alreadyPresent = context.messages.some((message) => {
+    if (message.role !== "assistant") {
+      return false;
+    }
+    const text = extractAssistantVisibleText(message);
+    return normalizeAssistantTranscriptCompareText(text) === normalizedVisibleText;
+  });
+  if (alreadyPresent) {
+    return false;
+  }
+
+  const message: Parameters<ReturnType<typeof guardSessionManager>["appendMessage"]>[0] = {
+    role: "assistant",
+    content: [{ type: "text", text: visibleText }],
+    timestamp: params.now ?? Date.now(),
+    stopReason: "stop",
+    usage: params.usage,
+    provider: params.provider,
+    model: params.modelId,
+    api: params.modelApi ?? "unknown",
+    openclawTranscriptRepair: {
+      reason: "missing-visible-assistant-text",
+      runId: params.runId,
+    },
+  } as unknown as Parameters<ReturnType<typeof guardSessionManager>["appendMessage"]>[0];
+  params.sessionManager.appendMessage(message);
+  params.activeSession.agent.state.messages = params.sessionManager.buildSessionContext().messages;
+  return true;
 }
 
 function removeTrailingMidTurnPrecheckAssistantError(params: {
@@ -2719,11 +2826,7 @@ export async function runEmbeddedAttempt(
           });
           effectivePrompt = orphanPromptMerge.prompt;
           if (orphanPromptMerge.removeLeaf) {
-            if (leafEntry.parentId) {
-              sessionManager.branch(leafEntry.parentId);
-            } else {
-              sessionManager.resetLeaf();
-            }
+            removeSessionManagerLeafEntry({ sessionManager, leafEntry });
             const sessionContext = sessionManager.buildSessionContext();
             activeSession.agent.state.messages = sessionContext.messages;
           }
@@ -3211,6 +3314,43 @@ export async function runEmbeddedAttempt(
           prePromptMessageCount,
         });
         attemptUsage = getUsageTotals();
+        if (!promptError && !aborted && !timedOut && !idleTimedOut && !timedOutDuringCompaction) {
+          try {
+            const repaired = ensureVisibleAssistantTextInSessionTranscript({
+              activeSession,
+              sessionManager,
+              visibleText: currentAttemptAssistant
+                ? (extractAssistantVisibleText(currentAttemptAssistant) ?? "")
+                : undefined,
+              assistantTexts,
+              provider: params.provider,
+              modelId: params.modelId,
+              modelApi: params.model.api,
+              usage: attemptUsage,
+              runId: params.runId,
+            });
+            if (repaired) {
+              messagesSnapshot = sessionManager.buildSessionContext().messages;
+              lastAssistant = messagesSnapshot
+                .slice()
+                .toReversed()
+                .find((m) => m.role === "assistant");
+              currentAttemptAssistant = findCurrentAttemptAssistantMessage({
+                messagesSnapshot,
+                prePromptMessageCount,
+              });
+              if (!isProbeSession) {
+                log.warn(
+                  `repaired missing visible assistant transcript turn: runId=${params.runId} sessionId=${params.sessionId}`,
+                );
+              }
+            }
+          } catch (repairErr) {
+            log.warn(
+              `failed to repair missing visible assistant transcript turn: runId=${params.runId} sessionId=${params.sessionId} err=${String(repairErr)}`,
+            );
+          }
+        }
         cacheBreak = cacheObservabilityEnabled
           ? completePromptCacheObservation({
               sessionId: params.sessionId,
