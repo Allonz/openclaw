@@ -611,6 +611,7 @@ export function ensureVisibleAssistantTextInSessionTranscript(params: {
   >;
   visibleText?: string;
   assistantTexts: readonly string[];
+  currentTurnStartIndex?: number;
   provider: string;
   modelId: string;
   modelApi?: string;
@@ -623,7 +624,7 @@ export function ensureVisibleAssistantTextInSessionTranscript(params: {
     params.assistantTexts
       .map((text) => text.trim())
       .filter(Boolean)
-      .join("")
+      .join("\n\n")
       .trim();
   const normalizedVisibleText = normalizeAssistantTranscriptCompareText(visibleText);
   if (!normalizedVisibleText) {
@@ -631,7 +632,11 @@ export function ensureVisibleAssistantTextInSessionTranscript(params: {
   }
 
   const context = params.sessionManager.buildSessionContext();
-  const alreadyPresent = context.messages.some((message) => {
+  const currentTurnMessages =
+    typeof params.currentTurnStartIndex === "number"
+      ? context.messages.slice(Math.max(0, params.currentTurnStartIndex))
+      : context.messages;
+  const alreadyPresent = currentTurnMessages.some((message) => {
     if (message.role !== "assistant") {
       return false;
     }
@@ -3323,6 +3328,7 @@ export async function runEmbeddedAttempt(
                 ? (extractAssistantVisibleText(currentAttemptAssistant) ?? "")
                 : undefined,
               assistantTexts,
+              currentTurnStartIndex: prePromptMessageCount,
               provider: params.provider,
               modelId: params.modelId,
               modelApi: params.model.api,

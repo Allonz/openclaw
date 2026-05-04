@@ -699,13 +699,13 @@ describe("ensureVisibleAssistantTextInSessionTranscript", () => {
     expect(activeSession.agent.state.messages).toBe(after);
   });
 
-  it("concatenates delivered chunks only when no canonical assistant text exists", () => {
+  it("preserves delivered block separators only when no canonical assistant text exists", () => {
     const before = [{ role: "user", content: "hello" }] as unknown as AgentMessage[];
     const after = [
       ...before,
       {
         role: "assistant",
-        content: [{ type: "text", text: "abcdef" }],
+        content: [{ type: "text", text: "First paragraph.\n\nSecond paragraph." }],
       },
     ] as unknown as AgentMessage[];
     const activeSession = { agent: { state: { messages: before } } };
@@ -722,7 +722,7 @@ describe("ensureVisibleAssistantTextInSessionTranscript", () => {
     const repaired = ensureVisibleAssistantTextInSessionTranscript({
       activeSession,
       sessionManager,
-      assistantTexts: ["abc", "def"],
+      assistantTexts: ["First paragraph.", "Second paragraph."],
       provider: "openai",
       modelId: "gpt-5.5",
       modelApi: "responses",
@@ -733,9 +733,60 @@ describe("ensureVisibleAssistantTextInSessionTranscript", () => {
     expect(repaired).toBe(true);
     expect(appendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        content: [{ type: "text", text: "abcdef" }],
+        content: [{ type: "text", text: "First paragraph.\n\nSecond paragraph." }],
       }),
     );
+  });
+
+  it("limits duplicate detection to the current turn when repairing", () => {
+    const before = [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Repeated answer" }],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "ask again" }],
+      },
+    ] as unknown as AgentMessage[];
+    const after = [
+      ...before,
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Repeated answer" }],
+      },
+    ] as unknown as AgentMessage[];
+    const activeSession = { agent: { state: { messages: before } } };
+    const appendMessage = vi.fn();
+    const sessionManager = {
+      buildSessionContext: vi.fn().mockReturnValueOnce({ messages: before }).mockReturnValueOnce({
+        messages: after,
+      }),
+      appendMessage,
+    } as unknown as Parameters<
+      typeof ensureVisibleAssistantTextInSessionTranscript
+    >[0]["sessionManager"];
+
+    const repaired = ensureVisibleAssistantTextInSessionTranscript({
+      activeSession,
+      sessionManager,
+      visibleText: "Repeated answer",
+      assistantTexts: ["Repeated answer"],
+      currentTurnStartIndex: 1,
+      provider: "openai",
+      modelId: "gpt-5.5",
+      modelApi: "responses",
+      runId: "run-repeated-answer",
+      now: 5,
+    });
+
+    expect(repaired).toBe(true);
+    expect(appendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: [{ type: "text", text: "Repeated answer" }],
+      }),
+    );
+    expect(activeSession.agent.state.messages).toBe(after);
   });
 
   it("does not fall back to delivered chunks when canonical assistant text is empty", () => {
