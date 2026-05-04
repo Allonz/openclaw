@@ -322,7 +322,10 @@ export class GatewayClient {
     }
     const createWebSocket = () => new WebSocket(url, wsOptions as ClientOptions);
     const ws = directAgent
-      ? dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(url, createWebSocket)
+      ? dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(
+          { actualUrl: url, expectedGatewayUrl: url },
+          createWebSocket,
+        )
       : createWebSocket();
     this.ws = ws;
     this.socketOpened = false;

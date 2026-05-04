@@ -443,22 +443,49 @@ export async function stopProxy(handle: ProxyHandle | null): Promise<void> {
   await handle.stop();
 }
 
-function isGatewayLoopbackControlPlaneUrl(value: string): boolean {
-  let url: URL;
+type GatewayControlPlaneBypassTarget = {
+  actualUrl: string;
+  expectedGatewayUrl: string;
+};
+
+function parseGatewayControlPlaneUrl(value: string): URL | null {
   try {
-    url = new URL(value);
+    return new URL(value);
   } catch {
-    return false;
+    return null;
   }
-  if (
-    url.protocol !== "ws:" &&
-    url.protocol !== "wss:" &&
-    url.protocol !== "http:" &&
-    url.protocol !== "https:"
-  ) {
-    return false;
+}
+
+function isGatewayControlPlaneProtocol(protocol: string): boolean {
+  return protocol === "ws:" || protocol === "wss:" || protocol === "http:" || protocol === "https:";
+}
+
+function isGatewayLoopbackControlPlaneUrl(value: string): boolean {
+  const url = parseGatewayControlPlaneUrl(value);
+  return (
+    url !== null &&
+    isGatewayControlPlaneProtocol(url.protocol) &&
+    isGatewayControlPlaneLoopbackHost(url.hostname)
+  );
+}
+
+function assertExactGatewayControlPlaneBypassTarget(
+  target: GatewayControlPlaneBypassTarget,
+): string {
+  if (!isGatewayLoopbackControlPlaneUrl(target.actualUrl)) {
+    throw new Error("proxy: dangerous Gateway control-plane bypass is loopback-only");
   }
-  return isGatewayControlPlaneLoopbackHost(url.hostname);
+  if (!isGatewayLoopbackControlPlaneUrl(target.expectedGatewayUrl)) {
+    throw new Error(
+      "proxy: Gateway control-plane bypass expected Gateway URL must be loopback-only",
+    );
+  }
+  if (target.actualUrl !== target.expectedGatewayUrl) {
+    throw new Error(
+      "proxy: Gateway control-plane bypass requires the actual URL to match the configured Gateway URL",
+    );
+  }
+  return target.actualUrl;
 }
 
 function isGatewayControlPlaneLoopbackHost(hostname: string): boolean {
@@ -467,12 +494,10 @@ function isGatewayControlPlaneLoopbackHost(hostname: string): boolean {
 }
 
 export function dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane<T>(
-  url: string,
+  target: GatewayControlPlaneBypassTarget,
   run: () => T,
 ): T {
-  if (!isGatewayLoopbackControlPlaneUrl(url)) {
-    throw new Error("proxy: dangerous Gateway control-plane bypass is loopback-only");
-  }
+  assertExactGatewayControlPlaneBypassTarget(target);
 
   const snapshot = nodeHttpStackSnapshot;
   if (!snapshot) {

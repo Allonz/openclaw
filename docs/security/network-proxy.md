@@ -198,6 +198,7 @@ proxy:
 ## Limits
 
 - The proxy improves coverage for process-local JavaScript HTTP and WebSocket clients, but it is not an OS-level network sandbox.
+- Gateway loopback control-plane traffic is allowed to connect directly only through a narrow internal bypass for local Gateway WebSocket setup. The bypass requires the actual connection URL to match the configured Gateway URL, so custom loopback ports still work without opening arbitrary loopback destinations.
 - Raw `net`, `tls`, and `http2` sockets, native addons, and child processes may bypass Node-level proxy routing unless they inherit and respect proxy environment variables.
 - User local WebUIs and local model servers should be allowlisted in the operator proxy policy when needed; OpenClaw does not expose a general local-network bypass for them.
 - Gateway control-plane proxy bypass is intentionally limited to `localhost` and literal loopback IP URLs. Use `ws://127.0.0.1:18789`, `ws://[::1]:18789`, or `ws://localhost:18789` for local direct Gateway control-plane connections; other hostnames route like ordinary hostname-based traffic.
